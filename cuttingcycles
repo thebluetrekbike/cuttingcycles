@@ -1,0 +1,216 @@
+import numpy as np
+import pandas as pd
+from scipy.fft import fft, fftfreq
+from scipy.signal import find_peaks, cheby2, filtfilt, savgol_filter
+import scipy.ndimage as ndimage
+import matplotlib.pyplot as plt
+
+class WaveAnalyzer:
+    def __init__(self, threshold, N, rs, Wn, timeseries, landiq, class_columns, subclass_columns, class_values, subclass_values, startdate, enddate, varColumn, idColumn, dateColumn, use_savgol=False):
+        self.threshold = threshold
+        self.N = N
+        self.rs = rs
+        self.Wn = Wn
+        self.timeseries = timeseries
+        self.landiq = landiq
+        self.class_columns = class_columns
+        self.subclass_columns = subclass_columns
+        self.class_values = class_values
+        self.subclass_values = subclass_values
+        self.startdate = startdate
+        self.enddate = enddate
+        self.varColumn = varColumn
+        self.idColumn = idColumn
+        self.dateColumn = dateColumn
+        self.use_savgol = use_savgol
+
+    def analyze_data(self, cloudydates):
+        # Filter the LandIQ data by the specified crop class 
+        class_conditions = []
+        for column in self.class_columns:
+            class_conditions.append(self.landiq[column].isin(self.class_values))
+        combined_class_condition = pd.concat(class_conditions, axis=1).any(axis=1)    
+        if self.subclass_values:
+            subclass_conditions = []
+            for column in self.subclass_columns:
+                subclass_conditions.append(self.landiq[column].isin(self.subclass_values))
+            combined_subclass_condition = pd.concat(subclass_conditions, axis=1).any(axis=1)
+            self.landiq = self.landiq[combined_class_condition & combined_subclass_condition]
+        else:
+            self.landiq = self.landiq[combined_class_condition]
+        
+        # Find the unique LandIQ field IDs for the specified crop class
+        self.ids = pd.unique(self.landiq[self.idColumn])
+
+        # Convert the date column to datetime in timeseries data
+        self.timeseries[self.dateColumn] = pd.to_datetime(self.timeseries[self.dateColumn])
+        
+        # Filter the timeseries by dates and exclude additional dates
+        exclude_dates = ['2020-06-28', '2020-06-30', '2020-09-11', '2020-09-13'] # wildfire smoke or spotty clouds
+        self.timeseries = self.timeseries[(self.timeseries[self.dateColumn] >= self.startdate) & (self.timeseries[self.dateColumn] <= self.enddate) & (~self.timeseries[self.dateColumn].isin(exclude_dates))]
+       
+        # Filter the timeseries by the LandIQ field IDs for the specified crop class
+        self.timeseries = self.timeseries[self.timeseries[self.idColumn].isin(self.ids)]
+ 
+        # Exclude rows that match any of the specified dates
+        self.timeseries = self.timeseries[~self.timeseries['date'].isin(cloudydates['date'])]
+                 
+        unique_ids = self.timeseries[self.idColumn].unique()
+        results = []
+
+        for unique_id in unique_ids:
+            # Extract the time series data for the current unique ID
+            data = self.timeseries.loc[self.timeseries[self.idColumn] == unique_id, self.varColumn].values
+
+            # Apply the savgol filter to the data
+            filtered_data = savgol_filter(data, 2, 1)
+            
+            # Apply moving median filter to the filtered data
+            window_size = 5  # Adjust the window size as per your requirements
+            filtered_data = ndimage.median_filter(filtered_data, size=window_size)
+
+            # Perform FFT to obtain frequency spectrum
+            spectrum = np.abs(fft(filtered_data))
+            frequencies = fftfreq(len(filtered_data))
+
+            # Find peaks in the spectrum
+            peaks, _ = find_peaks(spectrum, height=self.threshold)
+
+            # Calculate wave lengths based on peak frequencies
+            wave_lengths = 1 / frequencies[peaks]
+
+            # Store the results for the current unique ID
+            results.append({'UniqueID': unique_id, 
+                            'NumWaves': len(peaks), 
+                            'WaveLengths': wave_lengths, 
+                            'filtered_data': filtered_data})
+
+        return pd.DataFrame(results)
+    
+    # def phenometrics(self, timeseries):
+        
+    #     # pos, peak of season
+    #     pos = timeseries[self.varColumn].max() 
+    #     pos_time = timeseries.loc[timeseries[self.varColumn].idxmax(), self.dateColumn]
+        
+    #     # vos, peak of season
+    #     vos = timeseries[self.varColumn].min() 
+    #     vos_time = timeseries.loc[timeseries[self.varColumn].idxmin(), self.dateColumn]
+   
+        
+        
+    #     return results
+
+# Load the LandIQ data
+landiq = pd.read_csv(r'C:\Users\kdrechsler2\Box\Valley_Water\Tables\LandIQ\i15_Crop_Mapping_2020_Santa_Clara_Table.csv')
+
+# Load the timeseries data
+timeseries = pd.read_csv(r'C:\Users\kdrechsler2\Box\Valley_Water\Tables\Sentinel-2\VW_zonal_statistics_2019-2021_mean_uniqueID_copy.csv')
+
+# Import the CSV file into a DataFrame
+cloudydates = pd.read_csv('unique_dates_cloudy_50percent.csv')
+cloudydates['date'] = pd.to_datetime(cloudydates['date'])
+
+# Define parameters
+class_columns = ['CLASS1', 'CLASS2', 'CLASS3', 'CLASS4']
+subclass_columns = ['SUBCLASS1', 'SUBCLASS2', 'SUBCLASS3', 'SUBCLASS4']
+class_values = [' T'] # IMPORTANT: include any required leading spaces
+subclass_values = ['30'] # Put ['**'] if blank. REMEMBER leading spaces.
+startdate = '2020-01-01' # Start date of the analysis
+enddate = '2020-12-31' # End date of the analysis
+varColumn = 'NDVI' # Column name of the timeseries variable
+idColumn = 'UniqueID' # Column name of the unique field ID from LandIQ
+dateColumn = 'date' # Column name of the dates
+threshold = 0.1
+N = 5 # order of the filter, which determines the sharpness of the roll-off of
+# the filter response
+rs = 20 # stop band attenuation (dB), which determines how much the filter 
+# attenuates frequencies in the stop band region. Higher values of rs provide 
+# stronger attenuation in the stop band but may introduce more distortion in 
+# the passband.
+
+# Calculate the sampling rate (fs) in Hz
+fs = 1 / (5 * 24 * 60 * 60) # sampling rate, Hz
+
+# Set the desired frequency to filter out in days
+desired_frequency_days = 10 # desired frequency to filter out in days
+
+# Calculate the cutoff frequency (fc) in Hz
+fc = 1 / (desired_frequency_days * 24 * 60 * 60)
+# cutoff frequency in Hz, which represents the frequency at which the 
+# filter starts attenuating the signal. 
+
+# Calculate the normalized cutoff frequency (Wn)
+Wn = fc / fs # normalized cutoff frequency, which defines the point at 
+# which the filter starts to 
+# attenuate the frequencies. For a low-pass filter, Wn should be 
+# between 0 and 1, where 1 corresponds to the Nyquist frequency (half the 
+# sampling rate). The normalized cutoff frequency is used to define the transition 
+# from the passband to the stopband in the digital filter design process. 
+
+# Create an instance of WaveAnalyzer with the option to toggle between filters
+wave_analyzer_savgol = WaveAnalyzer(threshold, N, rs, Wn, timeseries, landiq, class_columns, subclass_columns, class_values, subclass_values, startdate, enddate, varColumn, idColumn, dateColumn, use_savgol=True)
+
+# Analyze the data for each separate time series using the Savitzky-Golay filter
+results = wave_analyzer_savgol.analyze_data(cloudydates)
+
+# output results as a .csv for viewing
+results.to_csv('cuttingcycles_results.csv', index=False)
+
+# Visualize the time series data using the Savitzky-Golay filter and the filtered_data
+for n in range(0, 5):
+    # Select a unique ID for visualization
+    unique_id = results['UniqueID'].iloc[n]
+
+    # Filter the raw time series data by the selected unique ID
+    raw_data = wave_analyzer_savgol.timeseries[wave_analyzer_savgol.timeseries[wave_analyzer_savgol.idColumn] == unique_id]
+
+    # Extract the variable values and dates
+    raw_values = raw_data[wave_analyzer_savgol.varColumn]
+    raw_dates = raw_data[wave_analyzer_savgol.dateColumn]
+
+    # Get the corresponding filtered data for the unique ID
+    filtered_values = results['filtered_data'].iloc[n]
+
+    # Plot the raw and filtered time series data
+    plt.figure(figsize=(10, 6))
+    plt.plot(raw_dates.values, raw_values.values, label='Raw Data')
+    plt.plot(raw_dates.values, filtered_values, label='Filtered Data (Savitzky-Golay)')
+    
+    plt.xlabel('Date')
+    plt.ylabel('Variable')
+    plt.title(f'Time Series Data for Unique ID: {unique_id} (Savitzky-Golay)')
+    plt.legend()
+    plt.show()
+
+
+# find out number of dates in between each time step
+dates=timeseries['date'].unique()
+# Calculate the difference between consecutive datetime elements
+time_diff = np.diff(dates)
+# Convert timedelta to number of days
+days_between_dates = time_diff.astype('timedelta64[D]')
+# Create a DataFrame with datetime and days_between_dates
+df = pd.DataFrame({'Datetime': dates[1:], 'Days_Between_Dates': days_between_dates})
+# Plot the data
+plt.figure(figsize=(10, 6))
+plt.plot(df['Datetime'].values, days_between_dates, marker='o', linestyle='-', color='b')
+plt.xlabel('Datetime')
+plt.ylabel('Days Between Dates')
+plt.title('Number of Days Between Consecutive Datetime Elements')
+plt.xticks(rotation=45)
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+
+# POS: peak of season
+# VOS: valley of season
+# SOS: start of season
+# EOS: end of season
+# LOS: length of season
+# ROI: rate of increase (good for early irrigation detection to compare with ET)
+
+
+
